@@ -26,35 +26,49 @@ pub(crate) static USE_TILE: OnceCell<bool> = OnceCell::new();
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct App {
-    #[clap(short, long, value_name = "INPUT_FILE", default_value = "")]
-    input_file: String,
-    #[clap(
-        short = 'I',
-        long,
-        value_name = "INPUT_FOLDER",
-        default_value = "images"
-    )]
-    input_images_folder: String,
-    #[clap(short, long, value_name = "OUTPUT_FILE", default_value = "")]
-    output_file: String,
+    /// Input image files or directories
+    #[arg(value_name = "PATH")]
+    inputs: Vec<String>,
+
+    /// Single output file path (requires exactly 1 input)
+    #[clap(short, long, value_name = "FILE", requires = "inputs")]
+    output_file: Option<String>,
+
+    /// Output naming pattern. {stem} = filename without ext, {ext} = original ext
+    #[clap(long, default_value = "{stem}.nbg.png")]
+    pattern: String,
+
+    /// Output directory for batch processing
+    #[clap(short = 'O', long, default_value = "output_images")]
+    output_dir: String,
+
     #[clap(short, long)]
     verbose: bool,
+
     #[clap(short, long, default_value = "false")]
     crop: bool,
-    #[clap(short = 'S', long, conflicts_with("input_file"))]
+
+    #[clap(short = 'S', long, conflicts_with = "inputs")]
     stdin: bool,
-    #[clap(short = 's', long, conflicts_with("output_file"))]
+
+    #[clap(short = 's', long, conflicts_with = "output_file")]
     stdout: bool,
+
     #[clap(short = 'H', long)]
     http: bool,
+
     #[clap(short, long, default_value = "0.0.0.0")]
     address: String,
+
     #[clap(short, long, default_value = "9876")]
     port: u16,
-    #[clap(long, default_value = "0.5", help = "Alpha floor (0-1). Pixels below this become transparent, rest stretched")]
+
+    #[clap(long, default_value = "0.5", help = "Alpha floor (0-1)")]
     threshold_bg: f32,
+
     #[clap(short, long, default_value = "assets/medium.onnx")]
     model: String,
+
     #[clap(short, long, default_value = "false")]
     tile: bool,
 }
@@ -70,7 +84,7 @@ async fn main() -> Result<()> {
     }
     let mut session = onnx::onnx_session(&args.model)?;
 
-    let img: Option<DynamicImage> = if args.stdin {
+    let img: Option<DynamicImage> =     if args.stdin {
         let mut buffer = Vec::new();
         io::stdin().read_to_end(&mut buffer)?;
         if is_jpeg(&buffer) {
@@ -116,43 +130,13 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     }
 
-    let input_images_folder = Path::new(&args.input_images_folder);
-    let output_images_folder = Path::new("output_images");
-    fs::create_dir_all(&output_images_folder)?;
-
-    let image_files: Vec<PathBuf>;
-    if !args.input_file.is_empty() {
-        image_files = vec![PathBuf::from(&args.input_file)];
-    } else {
-        image_files = fs::read_dir(&input_images_folder)?
-            .filter_map(|entry| {
-                if let Ok(entry) = entry {
-                    if let Some(extension) = entry.path().extension() {
-                        if extension == "jpg" || extension == "png" {
-                            return Some(entry.path());
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
-    }
+    let image_files = collect_inputs(&args.inputs);
 
     let model_dims = get_model_dims(&session);
 
-    for input_img_file in &image_files {
-        let output_img_file = output_images_folder.join(
-            input_img_file
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned()
-                + "_nbg.png",
-        );
-
+    for input_path in &image_files {
         let start_time = Instant::now();
-        let input_img = image::open(input_img_file).unwrap().into_rgba8();
+        let input_img = image::open(input_path).unwrap().into_rgba8();
 
         let output_img = if args.tile {
             process_tiled(&mut session, &input_img, model_dims)?
@@ -160,15 +144,29 @@ async fn main() -> Result<()> {
             process_single(&mut session, &input_img, model_dims)?
         };
 
-        output_img.save(&output_img_file)?;
+        let output_path = if let Some(ref out) = args.output_file {
+            PathBuf::from(out)
+        } else {
+            let stem = input_path.file_stem().unwrap().to_str().unwrap();
+            let fname = args.pattern.replace("{stem}", stem);
+            Path::new(&args.output_dir).join(fname)
+        };
+
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        output_img.save(&output_path)?;
 
         let elapsed_time = start_time.elapsed();
         println!(
             "Processed {} in {}.{:03} seconds",
-            input_img_file.display(),
+            input_path.display(),
             elapsed_time.as_secs(),
             elapsed_time.subsec_millis()
         );
+
         if args.crop {
             let mut output_img = output_img;
             let alpha_bounds = find_alpha_bounds(&output_img);
@@ -180,22 +178,54 @@ async fn main() -> Result<()> {
                 let mut full_cropped_img = ImageBuffer::new(max_x - min_x, max_y - min_y);
                 full_cropped_img.copy_from(&cropped_img, 0, 0).ok();
 
-                let mut output_img_file_cropped = output_img_file.clone();
-                if let Some(_extension) = output_img_file_cropped.extension() {
-                    let file_stem = output_img_file_cropped.file_stem().unwrap();
-                    let new_file_stem = format!("{}_cropped", file_stem.to_str().unwrap());
-                    output_img_file_cropped.set_file_name(new_file_stem);
+                let mut cropped_path = output_path.clone();
+                if let Some(stem) = cropped_path.file_stem() {
+                    let new_stem = format!("{}_cropped", stem.to_str().unwrap());
+                    cropped_path.set_file_name(new_stem);
+                    cropped_path.set_extension("png");
                 }
-
-                if let Some(extension) = output_img_file.extension() {
-                    output_img_file_cropped.set_extension(extension);
-                }
-
-                full_cropped_img.save(output_img_file_cropped)?;
+                full_cropped_img.save(cropped_path)?;
             }
         }
     }
     Ok(())
+}
+
+fn collect_inputs(paths: &[String]) -> Vec<PathBuf> {
+    if paths.is_empty() {
+        if let Ok(entries) = fs::read_dir("images") {
+            return entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "jpg" || ext == "png")
+                        .unwrap_or(false)
+                })
+                .map(|e| e.path())
+                .collect();
+        }
+        return vec![];
+    }
+
+    let mut files = Vec::new();
+    for path in paths {
+        let p = Path::new(path);
+        if p.is_dir() {
+            if let Ok(entries) = fs::read_dir(p) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let ep = entry.path();
+                    if ep.extension().map(|ext| ext == "jpg" || ext == "png").unwrap_or(false) {
+                        files.push(ep);
+                    }
+                }
+            }
+        } else if p.is_file() {
+            files.push(p.to_path_buf());
+        }
+    }
+    files.sort();
+    files
 }
 
 fn get_model_dims(session: &ort::session::Session) -> (u32, u32) {
