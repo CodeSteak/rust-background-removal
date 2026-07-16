@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
             } else if args.inputs.is_empty() || args.inputs.iter().any(|p| Path::new(p).is_dir()) {
                 PathBuf::from("output_images")
             } else {
-                PathBuf::from(".")
+                input_path.parent().unwrap_or(Path::new(".")).to_path_buf()
             };
             parent.join(fname)
         };
