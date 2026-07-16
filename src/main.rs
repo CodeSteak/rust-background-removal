@@ -20,7 +20,7 @@ mod http;
 mod onnx;
 
 static SESSION: OnceCell<Mutex<ort::session::Session>> = OnceCell::new();
-static THRESHOLD_BG: OnceCell<u8> = OnceCell::new();
+static THRESHOLD_BG: OnceCell<f32> = OnceCell::new();
 pub(crate) static USE_TILE: OnceCell<bool> = OnceCell::new();
 
 #[derive(Parser, Debug)]
@@ -51,8 +51,8 @@ pub struct App {
     address: String,
     #[clap(short, long, default_value = "9876")]
     port: u16,
-    #[clap(short, long, default_value = "10")]
-    threshold_bg: u8,
+    #[clap(short, long, default_value = "0.2", help = "Alpha floor (0-1). Pixels below this become transparent, rest stretched")]
+    threshold_bg: f32,
     #[clap(short, long, default_value = "assets/medium.onnx")]
     model: String,
     #[clap(short, long, default_value = "false")]
@@ -417,10 +417,11 @@ fn bilinear(a00: f32, a10: f32, a01: f32, a11: f32, fx: f32, fy: f32) -> f32 {
 }
 
 fn enhance_alpha(alpha: &mut ImageBuffer<Luma<u8>, Vec<u8>>) {
-    let contrast: f32 = 1.8;
+    let cutoff = THRESHOLD_BG.get().unwrap_or(&0.2).clamp(0.0, 1.0);
+    let scale = 1.0 / (1.0 - cutoff);
     for pixel in alpha.pixels_mut() {
         let a = pixel[0] as f32 / 255.0;
-        let enhanced = ((a - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+        let enhanced = ((a - cutoff) * scale).clamp(0.0, 1.0);
         pixel[0] = (enhanced * 255.0) as u8;
     }
 }
@@ -436,10 +437,10 @@ fn find_alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
     let mut max_x = 0;
     let mut min_y = u32::MAX;
     let mut max_y = 0;
-    let thres_b = THRESHOLD_BG.get().unwrap();
+    let thres_b = 10u8;
 
     for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel[3] > *thres_b {
+        if pixel[3] > thres_b {
             min_x = min_x.min(x);
             max_x = max_x.max(x);
             min_y = min_y.min(y);
