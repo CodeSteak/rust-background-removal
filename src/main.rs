@@ -39,8 +39,8 @@ pub struct App {
     pattern: String,
 
     /// Output directory for batch processing
-    #[clap(short = 'O', long, default_value = "output_images")]
-    output_dir: String,
+    #[clap(short = 'O', long)]
+    output_dir: Option<String>,
 
     #[clap(short, long)]
     verbose: bool,
@@ -156,7 +156,14 @@ async fn main() -> Result<()> {
         } else {
             let stem = input_path.file_stem().unwrap().to_str().unwrap();
             let fname = args.pattern.replace("{stem}", stem);
-            Path::new(&args.output_dir).join(fname)
+            let parent = if let Some(ref dir) = args.output_dir {
+                PathBuf::from(dir)
+            } else if args.inputs.is_empty() || args.inputs.iter().any(|p| Path::new(p).is_dir()) {
+                PathBuf::from("output_images")
+            } else {
+                PathBuf::from(".")
+            };
+            parent.join(fname)
         };
 
         if let Some(parent) = output_path.parent() {
