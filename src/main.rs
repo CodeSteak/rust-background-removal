@@ -20,8 +20,9 @@ mod http;
 mod onnx;
 
 static SESSION: OnceCell<Mutex<ort::session::Session>> = OnceCell::new();
-static THRESHOLD_BG: OnceCell<f32> = OnceCell::new();
 pub(crate) static USE_TILE: OnceCell<bool> = OnceCell::new();
+static ALPHA_LOW: OnceCell<f32> = OnceCell::new();
+static ALPHA_HIGH: OnceCell<f32> = OnceCell::new();
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -63,8 +64,11 @@ pub struct App {
     #[clap(short, long, default_value = "9876")]
     port: u16,
 
-    #[clap(short = 'a', long, default_value = "0.5", help = "Alpha floor (0-1)")]
-    threshold_bg: f32,
+    #[clap(short = 'l', long, default_value = "0.75", help = "Alpha lower floor (0-1). Below = transparent")]
+    alpha_low: f32,
+
+    #[clap(short = 'u', long, default_value = "0.92", help = "Alpha upper floor (0-1). Above = opaque")]
+    alpha_high: f32,
 
     #[clap(short, long, default_value = "assets/medium.onnx")]
     model: String,
@@ -77,7 +81,8 @@ pub struct App {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = App::parse();
-    THRESHOLD_BG.set(args.threshold_bg).ok();
+    ALPHA_LOW.set(args.alpha_low).ok();
+    ALPHA_HIGH.set(args.alpha_high).ok();
 
     if args.http {
         http::start_http_server(&args).await?;
@@ -461,11 +466,12 @@ fn bilinear(a00: f32, a10: f32, a01: f32, a11: f32, fx: f32, fy: f32) -> f32 {
 }
 
 fn enhance_alpha(alpha: &mut ImageBuffer<Luma<u8>, Vec<u8>>) {
-    let cutoff = THRESHOLD_BG.get().unwrap_or(&0.2).clamp(0.0, 1.0);
-    let scale = 1.0 / (1.0 - cutoff);
+    let low = ALPHA_LOW.get().copied().unwrap_or(0.75).clamp(0.0, 1.0);
+    let high = ALPHA_HIGH.get().copied().unwrap_or(0.92).clamp(low, 1.0);
+    let scale = if high > low { 1.0 / (high - low) } else { 1.0 };
     for pixel in alpha.pixels_mut() {
         let a = pixel[0] as f32 / 255.0;
-        let enhanced = ((a - cutoff) * scale).clamp(0.0, 1.0);
+        let enhanced = ((a - low) * scale).clamp(0.0, 1.0);
         pixel[0] = (enhanced * 255.0) as u8;
     }
 }
