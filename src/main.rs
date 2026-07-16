@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use image::io::Reader as ImageReader;
-use image::{imageops, GenericImage, ImageBuffer, RgbaImage};
-use image::{DynamicImage, ImageFormat};
+use image::{imageops, GenericImage, ImageBuffer, Luma, RgbaImage};
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use infer::image::is_jpeg;
 
 use ndarray::Array;
@@ -21,6 +21,7 @@ mod onnx;
 
 static SESSION: OnceCell<Mutex<ort::session::Session>> = OnceCell::new();
 static THRESHOLD_BG: OnceCell<u8> = OnceCell::new();
+pub(crate) static USE_TILE: OnceCell<bool> = OnceCell::new();
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -54,6 +55,8 @@ pub struct App {
     threshold_bg: u8,
     #[clap(short, long, default_value = "assets/medium.onnx")]
     model: String,
+    #[clap(short, long, default_value = "false")]
+    tile: bool,
 }
 
 #[tokio::main(worker_threads = 10)]
@@ -88,7 +91,7 @@ async fn main() -> Result<()> {
     };
 
     if img.is_some() {
-        let processed_dynamic_img = process_dynamic_image(&mut session, img.unwrap())?;
+        let processed_dynamic_img = process_dynamic_image(&mut session, img.unwrap(), args.tile)?;
         if args.crop {
             let mut output_img = processed_dynamic_img.to_rgba8();
             let alpha_bounds = find_alpha_bounds(&output_img);
@@ -135,6 +138,8 @@ async fn main() -> Result<()> {
             .collect();
     }
 
+    let model_dims = get_model_dims(&session);
+
     for input_img_file in &image_files {
         let output_img_file = output_images_folder.join(
             input_img_file
@@ -147,7 +152,15 @@ async fn main() -> Result<()> {
         );
 
         let start_time = Instant::now();
-        let mut output_img = process_image(&mut session, input_img_file, &output_img_file)?;
+        let input_img = image::open(input_img_file).unwrap().into_rgba8();
+
+        let output_img = if args.tile {
+            process_tiled(&mut session, &input_img, model_dims)?
+        } else {
+            process_single(&mut session, &input_img, model_dims)?
+        };
+
+        output_img.save(&output_img_file)?;
 
         let elapsed_time = start_time.elapsed();
         println!(
@@ -157,6 +170,7 @@ async fn main() -> Result<()> {
             elapsed_time.subsec_millis()
         );
         if args.crop {
+            let mut output_img = output_img;
             let alpha_bounds = find_alpha_bounds(&output_img);
 
             if let Some((min_x, min_y, max_x, max_y)) = alpha_bounds {
@@ -184,11 +198,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn process_image(
+fn get_model_dims(session: &ort::session::Session) -> (u32, u32) {
+    let shape = session.inputs()[0].dtype().tensor_shape().unwrap();
+    (shape[3] as u32, shape[2] as u32)
+}
+
+fn run_inference(
     session: &mut ort::session::Session,
-    input_img_file: &PathBuf,
-    output_img_file: &PathBuf,
-) -> Result<ImageBuffer<image::Rgba<u8>, Vec<u8>>, anyhow::Error> {
+    region: &RgbaImage,
+) -> Result<ImageBuffer<Luma<u8>, Vec<u8>>> {
     let input_shape: Vec<usize> = session
         .inputs()[0]
         .dtype()
@@ -197,43 +215,127 @@ fn process_image(
         .iter()
         .map(|&dim| dim as usize)
         .collect();
-    let input_img = image::open(input_img_file).unwrap().into_rgba8();
-    let scaling_factor = f32::min(
-        1.,
-        f32::min(
-            input_shape[3] as f32 / input_img.width() as f32,
-            input_shape[2] as f32 / input_img.height() as f32,
-        ),
-    );
-    let mut resized_img = imageops::resize(
-        &input_img,
-        input_shape[3] as u32,
-        input_shape[2] as u32,
-        imageops::FilterType::Triangle,
-    );
+
+    let model_w = input_shape[3] as u32;
+    let model_h = input_shape[2] as u32;
+
+    let resized = imageops::resize(region, model_w, model_h, imageops::FilterType::Triangle);
+
     let input_tensor = Array::from_shape_fn(input_shape, |indices| {
         let mean = 128.;
         let std = 256.;
-
-        (resized_img[(indices[3] as u32, indices[2] as u32)][indices[1]] as f32 - mean) / std
+        (resized[(indices[3] as u32, indices[2] as u32)][indices[1]] as f32 - mean) / std
     });
+
     let inputs = ort::inputs![Tensor::from_array(input_tensor)?];
     let outputs = session.run(inputs)?;
     let (shape, data) = outputs[0].try_extract_tensor::<f32>()?;
     let output_dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
     let array_view = ndarray::ArrayViewD::from_shape(output_dims, data)
         .map_err(|e| anyhow::anyhow!("shape error: {}", e))?;
+
+    let mut alpha_mask = ImageBuffer::new(model_w, model_h);
     for (indices, alpha) in array_view.indexed_iter() {
-        resized_img[(indices[3] as u32, indices[2] as u32)][3] = (alpha * 255.) as u8;
+        alpha_mask.put_pixel(
+            indices[3] as u32,
+            indices[2] as u32,
+            Luma([(*alpha * 255.) as u8]),
+        );
     }
-    let output_img = imageops::resize(
-        &resized_img,
-        (input_img.width() as f32 * scaling_factor) as u32,
-        (input_img.height() as f32 * scaling_factor) as u32,
-        imageops::FilterType::Triangle,
+    Ok(alpha_mask)
+}
+
+fn process_single(
+    session: &mut ort::session::Session,
+    input_img: &RgbaImage,
+    _model_dims: (u32, u32),
+) -> Result<RgbaImage> {
+    let alpha = run_inference(session, input_img)?;
+
+    let upscaled_alpha = imageops::resize(
+        &alpha,
+        input_img.width(),
+        input_img.height(),
+        imageops::FilterType::Lanczos3,
     );
-    output_img.save(output_img_file)?;
-    Ok(output_img)
+
+    let mut output = input_img.clone();
+    for (x, y, pixel) in output.enumerate_pixels_mut() {
+        pixel[3] = upscaled_alpha.get_pixel(x, y)[0];
+    }
+    Ok(output)
+}
+
+fn process_tiled(
+    session: &mut ort::session::Session,
+    input_img: &RgbaImage,
+    model_dims: (u32, u32),
+) -> Result<RgbaImage> {
+    let (model_w, model_h) = model_dims;
+    let img_w = input_img.width();
+    let img_h = input_img.height();
+
+    let overlap = model_w / 8;
+    let step = model_w - overlap;
+
+    let mut alpha_accum = vec![0.0f32; (img_w * img_h) as usize];
+    let mut weight_accum = vec![0.0f32; (img_w * img_h) as usize];
+
+    let mut ty = 0i32;
+    while ty < img_h as i32 {
+        let tile_y = (ty as u32).min(img_h.saturating_sub(model_h));
+        let mut tx = 0i32;
+        while tx < img_w as i32 {
+            let tile_x = (tx as u32).min(img_w.saturating_sub(model_w));
+
+            let tile_img = input_img
+                .view(tile_x, tile_y, model_w, model_h)
+                .to_image();
+
+            let alpha = run_inference(session, &tile_img)?;
+
+            for py in 0..model_h {
+                for px in 0..model_w {
+                    let abs_x = tile_x + px;
+                    let abs_y = tile_y + py;
+                    if abs_x >= img_w || abs_y >= img_h {
+                        continue;
+                    }
+
+                    let alpha_val = alpha.get_pixel(px, py)[0] as f32 / 255.0;
+
+                    let wx = overlap_dist(px, model_w, overlap);
+                    let wy = overlap_dist(py, model_h, overlap);
+                    let weight = wx.min(wy);
+
+                    let idx = (abs_y * img_w + abs_x) as usize;
+                    alpha_accum[idx] += alpha_val * weight;
+                    weight_accum[idx] += weight;
+                }
+            }
+
+            tx += step as i32;
+        }
+        ty += step as i32;
+    }
+
+    let mut output = input_img.clone();
+    for (x, y, pixel) in output.enumerate_pixels_mut() {
+        let idx = (y * img_w + x) as usize;
+        let alpha = if weight_accum[idx] > 0.0 {
+            ((alpha_accum[idx] / weight_accum[idx]) * 255.0) as u8
+        } else {
+            0u8
+        };
+        pixel[3] = alpha;
+    }
+    Ok(output)
+}
+
+fn overlap_dist(px: u32, dim: u32, overlap: u32) -> f32 {
+    let left = px.min(overlap);
+    let right = (dim - px - 1).min(overlap);
+    (left.min(right) as f32 / overlap as f32).clamp(0.0, 1.0)
 }
 
 fn find_alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
@@ -263,49 +365,16 @@ fn find_alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
 fn process_dynamic_image(
     session: &mut ort::session::Session,
     dynamic_img: DynamicImage,
+    tile: bool,
 ) -> Result<DynamicImage, anyhow::Error> {
-    let input_shape: Vec<usize> = session
-        .inputs()[0]
-        .dtype()
-        .tensor_shape()
-        .unwrap()
-        .iter()
-        .map(|&dim| dim as usize)
-        .collect();
     let input_img = dynamic_img.into_rgba8();
-    let scaling_factor = f32::min(
-        1.,
-        f32::min(
-            input_shape[3] as f32 / input_img.width() as f32,
-            input_shape[2] as f32 / input_img.height() as f32,
-        ),
-    );
-    let mut resized_img = imageops::resize(
-        &input_img,
-        input_shape[3] as u32,
-        input_shape[2] as u32,
-        imageops::FilterType::Triangle,
-    );
-    let input_tensor = Array::from_shape_fn(input_shape, |indices| {
-        let mean = 128.;
-        let std = 256.;
+    let model_dims = get_model_dims(session);
 
-        (resized_img[(indices[3] as u32, indices[2] as u32)][indices[1]] as f32 - mean) / std
-    });
-    let inputs = ort::inputs![Tensor::from_array(input_tensor)?];
-    let outputs = session.run(inputs)?;
-    let (shape, data) = outputs[0].try_extract_tensor::<f32>()?;
-    let output_dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-    let array_view = ndarray::ArrayViewD::from_shape(output_dims, data)
-        .map_err(|e| anyhow::anyhow!("shape error: {}", e))?;
-    for (indices, alpha) in array_view.indexed_iter() {
-        resized_img[(indices[3] as u32, indices[2] as u32)][3] = (alpha * 255.) as u8;
-    }
-    let output_img = imageops::resize(
-        &resized_img,
-        (input_img.width() as f32 * scaling_factor) as u32,
-        (input_img.height() as f32 * scaling_factor) as u32,
-        imageops::FilterType::Triangle,
-    );
-    Ok(DynamicImage::ImageRgba8(output_img))
+    let output = if tile {
+        process_tiled(session, &input_img, model_dims)?
+    } else {
+        process_single(session, &input_img, model_dims)?
+    };
+
+    Ok(DynamicImage::ImageRgba8(output))
 }

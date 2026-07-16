@@ -17,6 +17,7 @@ use std::net::Ipv4Addr;
 pub async fn start_http_server(args: &App) -> Result<(), anyhow::Error> {
     let session = crate::onnx::onnx_session(&args.model).unwrap();
     crate::SESSION.set(tokio::sync::Mutex::new(session)).ok();
+    crate::USE_TILE.set(args.tile).ok();
     let make_svc = make_service_fn(|_conn| async {
         Ok::<_, Infallible>(service_fn(move |req| handle_post(req)))
     });
@@ -83,7 +84,7 @@ pub async fn handle_post(req: Request<Body>) -> Result<Response<Body>, hyper::Er
                         if img.is_some() {
                             println!("f: {}", file_name);
                             let processed_dynamic_img =
-                                crate::process_dynamic_image(&mut session, img.unwrap()).unwrap();
+                                crate::process_dynamic_image(&mut session, img.unwrap(), crate::USE_TILE.get().copied().unwrap_or(false)).unwrap();
 
                             let mut crop_box: String = String::new();
                             let mut buffer = Cursor::new(Vec::new());
