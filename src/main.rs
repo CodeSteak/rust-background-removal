@@ -51,7 +51,7 @@ pub struct App {
     address: String,
     #[clap(short, long, default_value = "9876")]
     port: u16,
-    #[clap(short, long, default_value = "0.2", help = "Alpha floor (0-1). Pixels below this become transparent, rest stretched")]
+    #[clap(short, long, default_value = "0.5", help = "Alpha floor (0-1). Pixels below this become transparent, rest stretched")]
     threshold_bg: f32,
     #[clap(short, long, default_value = "assets/medium.onnx")]
     model: String,
