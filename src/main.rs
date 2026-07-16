@@ -82,6 +82,13 @@ async fn main() -> Result<()> {
     if args.http {
         http::start_http_server(&args).await?;
     }
+    #[cfg(any(feature="model-small", feature="model-medium", feature="model-large"))]
+    let mut session = if args.model == "assets/medium.onnx" {
+        onnx::onnx_session_embedded()?
+    } else {
+        onnx::onnx_session(&args.model)?
+    };
+    #[cfg(not(any(feature="model-small", feature="model-medium", feature="model-large")))]
     let mut session = onnx::onnx_session(&args.model)?;
 
     let img: Option<DynamicImage> =     if args.stdin {
