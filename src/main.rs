@@ -275,10 +275,8 @@ fn process_tiled(
     let img_w = input_img.width();
     let img_h = input_img.height();
 
-    let alpha_global = {
-        let alpha = run_inference(session, input_img)?;
-        imageops::resize(&alpha, img_w, img_h, imageops::FilterType::Lanczos3)
-    };
+    let alpha_global_lowres = run_inference(session, input_img)?;
+    let alpha_global = imageops::resize(&alpha_global_lowres, img_w, img_h, imageops::FilterType::Lanczos3);
 
     let overlap = model_w / 4;
     let step = model_w - overlap;
@@ -317,6 +315,10 @@ fn process_tiled(
 
             let alpha = run_inference(session, &tile_img)?;
 
+            let global_tile = alpha_global.view(tile_x, tile_y, model_w, model_h).to_image();
+
+            let calibrated = calibrate_to_global(&alpha, &global_tile, 8);
+
             for py in 0..model_h {
                 for px in 0..model_w {
                     let abs_x = tile_x + px;
@@ -325,17 +327,14 @@ fn process_tiled(
                         continue;
                     }
 
-                    let tile_a = alpha.get_pixel(px, py)[0] as f32 / 255.0;
-                    let global_a = alpha_global.get_pixel(abs_x, abs_y)[0] as f32 / 255.0;
-
-                    let blended = tile_a * 0.3 + global_a * 0.7;
+                    let alpha_val = calibrated.get_pixel(px, py)[0] as f32 / 255.0;
 
                     let wx = overlap_dist(px, model_w, overlap);
                     let wy = overlap_dist(py, model_h, overlap);
                     let weight = wx.min(wy);
 
                     let idx = (abs_y * img_w + abs_x) as usize;
-                    alpha_accum[idx] += blended * weight;
+                    alpha_accum[idx] += alpha_val * weight;
                     weight_accum[idx] += weight;
                 }
             }
@@ -353,6 +352,63 @@ fn process_tiled(
         pixel[3] = alpha;
     }
     Ok(output)
+}
+
+fn calibrate_to_global(
+    tile: &ImageBuffer<Luma<u8>, Vec<u8>>,
+    global: &ImageBuffer<Luma<u8>, Vec<u8>>,
+    block_size: u32,
+) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+    let w = tile.width();
+    let h = tile.height();
+    let mut result = ImageBuffer::new(w, h);
+
+    let mut by: u32 = 0;
+    while by < h {
+        let bh = block_size.min(h - by);
+        let mut bx: u32 = 0;
+        while bx < w {
+            let bw = block_size.min(w - bx);
+
+            let b00 = tile.get_pixel(bx, by)[0] as f32;
+            let b10 = tile.get_pixel(bx + bw - 1, by)[0] as f32;
+            let b01 = tile.get_pixel(bx, by + bh - 1)[0] as f32;
+            let b11 = tile.get_pixel(bx + bw - 1, by + bh - 1)[0] as f32;
+
+            let g00 = global.get_pixel(bx, by)[0] as f32;
+            let g10 = global.get_pixel(bx + bw - 1, by)[0] as f32;
+            let g01 = global.get_pixel(bx, by + bh - 1)[0] as f32;
+            let g11 = global.get_pixel(bx + bw - 1, by + bh - 1)[0] as f32;
+
+            for py in 0..bh {
+                for px in 0..bw {
+                    let fx = px as f32 / (bw.max(1) - 1).max(1) as f32;
+                    let fy = py as f32 / (bh.max(1) - 1).max(1) as f32;
+
+                    let t_interp = bilinear(b00, b10, b01, b11, fx, fy);
+                    let g_interp = bilinear(g00, g10, g01, g11, fx, fy);
+
+                    let tile_val = tile.get_pixel(bx + px, by + py)[0] as f32;
+                    let calib = (tile_val - t_interp + g_interp).clamp(0.0, 255.0);
+
+                    result.put_pixel(bx + px, by + py, Luma([calib as u8]));
+                }
+            }
+
+            bx += bw;
+        }
+        by += bh;
+    }
+
+    result
+}
+
+fn bilinear(a00: f32, a10: f32, a01: f32, a11: f32, fx: f32, fy: f32) -> f32 {
+    let w00 = (1.0 - fx) * (1.0 - fy);
+    let w10 = fx * (1.0 - fy);
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+    a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11
 }
 
 fn overlap_dist(px: u32, dim: u32, overlap: u32) -> f32 {
