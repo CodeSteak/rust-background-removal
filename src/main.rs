@@ -23,6 +23,7 @@ static SESSION: OnceCell<Mutex<ort::session::Session>> = OnceCell::new();
 pub(crate) static USE_TILE: OnceCell<bool> = OnceCell::new();
 static ALPHA_LOW: OnceCell<f32> = OnceCell::new();
 static ALPHA_HIGH: OnceCell<f32> = OnceCell::new();
+static ALPHA_BINARY: OnceCell<bool> = OnceCell::new();
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -64,11 +65,14 @@ pub struct App {
     #[clap(short, long, default_value = "9876")]
     port: u16,
 
-    #[clap(short = 'l', long, default_value = "0.75", help = "Alpha lower floor (0-1). Below = transparent")]
+    #[clap(short = 'l', long, default_value = "0.4", help = "Alpha lower floor (0-1). Below = transparent")]
     alpha_low: f32,
 
     #[clap(short = 'u', long, default_value = "0.92", help = "Alpha upper floor (0-1). Above = opaque")]
     alpha_high: f32,
+
+    #[clap(short = 'a', long, default_value = "false", help = "Binary alpha threshold: fully opaque above midpoint of -l/-u, else transparent")]
+    alpha_binary: bool,
 
     #[clap(short, long, default_value = "assets/medium.onnx")]
     model: String,
@@ -83,6 +87,7 @@ async fn main() -> Result<()> {
     let args = App::parse();
     ALPHA_LOW.set(args.alpha_low).ok();
     ALPHA_HIGH.set(args.alpha_high).ok();
+    ALPHA_BINARY.set(args.alpha_binary).ok();
 
     if args.http {
         http::start_http_server(&args).await?;
@@ -468,6 +473,15 @@ fn bilinear(a00: f32, a10: f32, a01: f32, a11: f32, fx: f32, fy: f32) -> f32 {
 fn enhance_alpha(alpha: &mut ImageBuffer<Luma<u8>, Vec<u8>>) {
     let low = ALPHA_LOW.get().copied().unwrap_or(0.75).clamp(0.0, 1.0);
     let high = ALPHA_HIGH.get().copied().unwrap_or(0.92).clamp(low, 1.0);
+    let binary = ALPHA_BINARY.get().copied().unwrap_or(false);
+    if binary {
+        let threshold = (low + high) * 0.5;
+        for pixel in alpha.pixels_mut() {
+            let a = pixel[0] as f32 / 255.0;
+            pixel[0] = if a >= threshold { 255 } else { 0 };
+        }
+        return;
+    }
     let scale = if high > low { 1.0 / (high - low) } else { 1.0 };
     for pixel in alpha.pixels_mut() {
         let a = pixel[0] as f32 / 255.0;
