@@ -311,18 +311,9 @@ fn process_tiled(
 
     for &tile_y in &tile_positions_y {
         for &tile_x in &tile_positions_x {
-            let mut tile_img = input_img
+            let tile_img = input_img
                 .view(tile_x, tile_y, model_w, model_h)
                 .to_image();
-
-            for (gx, gy, pixel) in tile_img.enumerate_pixels_mut() {
-                let ga = alpha_global.get_pixel(tile_x + gx, tile_y + gy)[0];
-                if ga < 64 {
-                    pixel[0] = 255;
-                    pixel[1] = 255;
-                    pixel[2] = 255;
-                }
-            }
 
             let alpha = run_inference(session, &tile_img)?;
 
@@ -337,13 +328,7 @@ fn process_tiled(
                     let tile_a = alpha.get_pixel(px, py)[0] as f32 / 255.0;
                     let global_a = alpha_global.get_pixel(abs_x, abs_y)[0] as f32 / 255.0;
 
-                    let blended = if tile_a > global_a {
-                        tile_a
-                    } else if tile_a < global_a * 0.3 {
-                        global_a
-                    } else {
-                        tile_a
-                    };
+                    let blended = tile_a * 0.3 + global_a * 0.7;
 
                     let wx = overlap_dist(px, model_w, overlap);
                     let wy = overlap_dist(py, model_h, overlap);
@@ -371,8 +356,8 @@ fn process_tiled(
 }
 
 fn overlap_dist(px: u32, dim: u32, overlap: u32) -> f32 {
-    let left = px.min(overlap);
-    let right = (dim - px - 1).min(overlap);
+    let left = px.min(overlap).max(1);
+    let right = (dim - px - 1).min(overlap).max(1);
     (left.min(right) as f32 / overlap as f32).clamp(0.0, 1.0)
 }
 
