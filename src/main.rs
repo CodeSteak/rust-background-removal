@@ -277,6 +277,10 @@ fn process_tiled(
     let img_w = input_img.width();
     let img_h = input_img.height();
 
+    if img_w < model_w || img_h < model_h {
+        return process_single(session, input_img, model_dims);
+    }
+
     let alpha_global_lowres = run_inference(session, input_img)?;
     let alpha_global = imageops::resize(&alpha_global_lowres, img_w, img_h, imageops::FilterType::Lanczos3);
 
