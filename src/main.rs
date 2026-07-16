@@ -252,12 +252,14 @@ fn process_single(
 ) -> Result<RgbaImage> {
     let alpha = run_inference(session, input_img)?;
 
-    let upscaled_alpha = imageops::resize(
+    let mut upscaled_alpha = imageops::resize(
         &alpha,
         input_img.width(),
         input_img.height(),
         imageops::FilterType::Lanczos3,
     );
+
+    enhance_alpha(&mut upscaled_alpha);
 
     let mut output = input_img.clone();
     for (x, y, pixel) in output.enumerate_pixels_mut() {
@@ -319,6 +321,9 @@ fn process_tiled(
 
             let calibrated = calibrate_to_global(&alpha, &global_tile, 8);
 
+            let mut enhanced = calibrated;
+            enhance_alpha(&mut enhanced);
+
             for py in 0..model_h {
                 for px in 0..model_w {
                     let abs_x = tile_x + px;
@@ -327,7 +332,7 @@ fn process_tiled(
                         continue;
                     }
 
-                    let alpha_val = calibrated.get_pixel(px, py)[0] as f32 / 255.0;
+                    let alpha_val = enhanced.get_pixel(px, py)[0] as f32 / 255.0;
 
                     let wx = overlap_dist(px, model_w, overlap);
                     let wy = overlap_dist(py, model_h, overlap);
@@ -363,41 +368,37 @@ fn calibrate_to_global(
     let h = tile.height();
     let mut result = ImageBuffer::new(w, h);
 
-    let mut by: u32 = 0;
-    while by < h {
-        let bh = block_size.min(h - by);
-        let mut bx: u32 = 0;
-        while bx < w {
-            let bw = block_size.min(w - bx);
+    let cols = ((w + block_size - 1) / block_size) as usize + 1;
+    let rows = ((h + block_size - 1) / block_size) as usize + 1;
+    let mut offsets = vec![0.0f32; cols * rows];
 
-            let b00 = tile.get_pixel(bx, by)[0] as f32;
-            let b10 = tile.get_pixel(bx + bw - 1, by)[0] as f32;
-            let b01 = tile.get_pixel(bx, by + bh - 1)[0] as f32;
-            let b11 = tile.get_pixel(bx + bw - 1, by + bh - 1)[0] as f32;
-
-            let g00 = global.get_pixel(bx, by)[0] as f32;
-            let g10 = global.get_pixel(bx + bw - 1, by)[0] as f32;
-            let g01 = global.get_pixel(bx, by + bh - 1)[0] as f32;
-            let g11 = global.get_pixel(bx + bw - 1, by + bh - 1)[0] as f32;
-
-            for py in 0..bh {
-                for px in 0..bw {
-                    let fx = px as f32 / (bw.max(1) - 1).max(1) as f32;
-                    let fy = py as f32 / (bh.max(1) - 1).max(1) as f32;
-
-                    let t_interp = bilinear(b00, b10, b01, b11, fx, fy);
-                    let g_interp = bilinear(g00, g10, g01, g11, fx, fy);
-
-                    let tile_val = tile.get_pixel(bx + px, by + py)[0] as f32;
-                    let calib = (tile_val - t_interp + g_interp).clamp(0.0, 255.0);
-
-                    result.put_pixel(bx + px, by + py, Luma([calib as u8]));
-                }
-            }
-
-            bx += bw;
+    for r in 0..rows {
+        let cy = ((r as u32) * block_size).min(h - 1);
+        for c in 0..cols {
+            let cx = ((c as u32) * block_size).min(w - 1);
+            offsets[r * cols + c] =
+                global.get_pixel(cx, cy)[0] as f32 - tile.get_pixel(cx, cy)[0] as f32;
         }
-        by += bh;
+    }
+
+    for py in 0..h {
+        let by = py / block_size;
+        let fy = (py % block_size) as f32 / (block_size as f32);
+        for px in 0..w {
+            let bx = px / block_size;
+            let fx = (px % block_size) as f32 / (block_size as f32);
+
+            let o00 = offsets[by as usize * cols + bx as usize];
+            let o10 = offsets[by as usize * cols + (bx + 1).min(cols as u32 - 1) as usize];
+            let o01 = offsets[(by + 1).min(rows as u32 - 1) as usize * cols + bx as usize];
+            let o11 = offsets[(by + 1).min(rows as u32 - 1) as usize * cols
+                + (bx + 1).min(cols as u32 - 1) as usize];
+
+            let offset = bilinear(o00, o10, o01, o11, fx, fy);
+            let calib = (tile.get_pixel(px, py)[0] as f32 + offset).clamp(0.0, 255.0);
+
+            result.put_pixel(px, py, Luma([calib as u8]));
+        }
     }
 
     result
@@ -409,6 +410,15 @@ fn bilinear(a00: f32, a10: f32, a01: f32, a11: f32, fx: f32, fy: f32) -> f32 {
     let w01 = (1.0 - fx) * fy;
     let w11 = fx * fy;
     a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11
+}
+
+fn enhance_alpha(alpha: &mut ImageBuffer<Luma<u8>, Vec<u8>>) {
+    let contrast: f32 = 1.8;
+    for pixel in alpha.pixels_mut() {
+        let a = pixel[0] as f32 / 255.0;
+        let enhanced = ((a - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+        pixel[0] = (enhanced * 255.0) as u8;
+    }
 }
 
 fn overlap_dist(px: u32, dim: u32, overlap: u32) -> f32 {
