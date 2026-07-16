@@ -57,13 +57,13 @@ pub struct App {
     #[clap(short = 'H', long)]
     http: bool,
 
-    #[clap(short, long, default_value = "0.0.0.0")]
+    #[clap(long, default_value = "0.0.0.0")]
     address: String,
 
     #[clap(short, long, default_value = "9876")]
     port: u16,
 
-    #[clap(long, default_value = "0.5", help = "Alpha floor (0-1)")]
+    #[clap(short = 'a', long, default_value = "0.5", help = "Alpha floor (0-1)")]
     threshold_bg: f32,
 
     #[clap(short, long, default_value = "assets/medium.onnx")]
