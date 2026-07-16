@@ -275,22 +275,54 @@ fn process_tiled(
     let img_w = input_img.width();
     let img_h = input_img.height();
 
-    let overlap = model_w / 8;
+    let alpha_global = {
+        let alpha = run_inference(session, input_img)?;
+        imageops::resize(&alpha, img_w, img_h, imageops::FilterType::Lanczos3)
+    };
+
+    let overlap = model_w / 4;
     let step = model_w - overlap;
 
     let mut alpha_accum = vec![0.0f32; (img_w * img_h) as usize];
     let mut weight_accum = vec![0.0f32; (img_w * img_h) as usize];
 
-    let mut ty = 0i32;
-    while ty < img_h as i32 {
-        let tile_y = (ty as u32).min(img_h.saturating_sub(model_h));
-        let mut tx = 0i32;
-        while tx < img_w as i32 {
-            let tile_x = (tx as u32).min(img_w.saturating_sub(model_w));
+    let mut tile_positions_x: Vec<u32> = Vec::new();
+    {
+        let mut tx: u32 = 0;
+        while tx < img_w {
+            let tile_x = tx.min(img_w.saturating_sub(model_w));
+            if tile_positions_x.is_empty() || tile_x != *tile_positions_x.last().unwrap() {
+                tile_positions_x.push(tile_x);
+            }
+            tx += step;
+        }
+    }
+    let mut tile_positions_y: Vec<u32> = Vec::new();
+    {
+        let mut ty: u32 = 0;
+        while ty < img_h {
+            let tile_y = ty.min(img_h.saturating_sub(model_h));
+            if tile_positions_y.is_empty() || tile_y != *tile_positions_y.last().unwrap() {
+                tile_positions_y.push(tile_y);
+            }
+            ty += step;
+        }
+    }
 
-            let tile_img = input_img
+    for &tile_y in &tile_positions_y {
+        for &tile_x in &tile_positions_x {
+            let mut tile_img = input_img
                 .view(tile_x, tile_y, model_w, model_h)
                 .to_image();
+
+            for (gx, gy, pixel) in tile_img.enumerate_pixels_mut() {
+                let ga = alpha_global.get_pixel(tile_x + gx, tile_y + gy)[0];
+                if ga < 64 {
+                    pixel[0] = 255;
+                    pixel[1] = 255;
+                    pixel[2] = 255;
+                }
+            }
 
             let alpha = run_inference(session, &tile_img)?;
 
@@ -302,21 +334,27 @@ fn process_tiled(
                         continue;
                     }
 
-                    let alpha_val = alpha.get_pixel(px, py)[0] as f32 / 255.0;
+                    let tile_a = alpha.get_pixel(px, py)[0] as f32 / 255.0;
+                    let global_a = alpha_global.get_pixel(abs_x, abs_y)[0] as f32 / 255.0;
+
+                    let blended = if tile_a > global_a {
+                        tile_a
+                    } else if tile_a < global_a * 0.3 {
+                        global_a
+                    } else {
+                        tile_a
+                    };
 
                     let wx = overlap_dist(px, model_w, overlap);
                     let wy = overlap_dist(py, model_h, overlap);
                     let weight = wx.min(wy);
 
                     let idx = (abs_y * img_w + abs_x) as usize;
-                    alpha_accum[idx] += alpha_val * weight;
+                    alpha_accum[idx] += blended * weight;
                     weight_accum[idx] += weight;
                 }
             }
-
-            tx += step as i32;
         }
-        ty += step as i32;
     }
 
     let mut output = input_img.clone();
