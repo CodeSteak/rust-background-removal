@@ -12,9 +12,17 @@ medium:
 large:
 	cargo build --release --features model-large
 
-install: large
+install: medium
 	install -Dm755 target/release/rust-background-removal ~/.local/bin/rust-background-removal
-	@echo "Installed to ~/.local/bin/rust-background-removal"
+	@echo "Installed (medium, 84MB) to ~/.local/bin/rust-background-removal"
+
+small-install: small
+	install -Dm755 target/release/rust-background-removal ~/.local/bin/rust-background-removal
+	@echo "Installed (small, 42MB) to ~/.local/bin/rust-background-removal"
+
+large-install: large
+	install -Dm755 target/release/rust-background-removal ~/.local/bin/rust-background-removal
+	@echo "Installed (large, 168MB) to ~/.local/bin/rust-background-removal"
 
 clean:
 	cargo clean
