@@ -1,25 +1,22 @@
 use crate::App;
 use anyhow::{Context, Result};
-use clap::Parser;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use image::io::Reader as ImageReader;
-use image::{imageops, GenericImage, ImageBuffer, Rgba, RgbaImage};
+use image::{imageops, ImageBuffer, Rgba, RgbaImage};
 use image::{DynamicImage, ImageFormat};
 use infer::image::is_jpeg;
 use multer::Multipart;
 
 use std::convert::Infallible;
 
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor};
 
-// use tokio::io::AsyncWriteExt;
 use std::net::Ipv4Addr;
 
 pub async fn start_http_server(args: &App) -> Result<(), anyhow::Error> {
     let session = crate::onnx::onnx_session(&args.model).unwrap();
-    crate::SESSION.set(session).ok();
-    // Define a closure to handle incoming HTTP requests
+    crate::SESSION.set(tokio::sync::Mutex::new(session)).ok();
     let make_svc = make_service_fn(|_conn| async {
         Ok::<_, Infallible>(service_fn(move |req| handle_post(req)))
     });
@@ -38,18 +35,16 @@ pub async fn start_http_server(args: &App) -> Result<(), anyhow::Error> {
             println!("Invalid IP address");
         }
     }
-    // Access the parsed values
     Ok(())
 }
 
 pub async fn handle_post(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     let path = req.uri().clone().path().to_owned();
-    let session = crate::SESSION.get().unwrap();
-    // Check if the request is a multipart POST
+    let session_lock = crate::SESSION.get().unwrap();
+    let mut session = session_lock.lock().await;
     if let Some(content_type) = req.headers().get(hyper::header::CONTENT_TYPE) {
         if let Ok(content_type_str) = content_type.to_str() {
             if content_type_str.starts_with("multipart/form-data") {
-                // Parse the boundary from the content_type, exit early if we don't have it.
                 let boundary = match content_type_str
                     .split(';')
                     .find(|s| s.trim().starts_with("boundary="))
@@ -88,7 +83,7 @@ pub async fn handle_post(req: Request<Body>) -> Result<Response<Body>, hyper::Er
                         if img.is_some() {
                             println!("f: {}", file_name);
                             let processed_dynamic_img =
-                                crate::process_dynamic_image(session, img.unwrap()).unwrap();
+                                crate::process_dynamic_image(&mut session, img.unwrap()).unwrap();
 
                             let mut crop_box: String = String::new();
                             let mut buffer = Cursor::new(Vec::new());
@@ -123,7 +118,6 @@ pub async fn handle_post(req: Request<Body>) -> Result<Response<Body>, hyper::Er
                                             .unwrap();
                                     }
                                 } else {
-                                    // Set the pixel at (0, 0) to be fully transparent.
                                     let mut img: RgbaImage = ImageBuffer::new(1, 1);
                                     img.put_pixel(0, 0, Rgba([0, 0, 0, 0]));
                                     img.write_to(&mut buffer, ImageFormat::Png).unwrap();
@@ -161,7 +155,6 @@ pub async fn handle_post(req: Request<Body>) -> Result<Response<Body>, hyper::Er
         }
     }
 
-    // If the request is not a multipart POST, return a 400 Bad Request response
     let response = Response::builder()
         .status(400)
         .body(Body::from("Bad Request: Invalid content type"))

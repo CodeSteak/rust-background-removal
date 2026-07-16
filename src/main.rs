@@ -6,20 +6,20 @@ use image::{imageops, GenericImage, ImageBuffer, RgbaImage};
 use image::{DynamicImage, ImageFormat};
 use infer::image::is_jpeg;
 
-use ndarray::{Array, CowArray};
+use ndarray::Array;
 use once_cell::sync::OnceCell;
-use ort::Value;
+use ort::value::Tensor;
+use tokio::sync::Mutex;
 
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-// use tokio::io::AsyncWriteExt;
 
 mod http;
 mod onnx;
 
-static SESSION: OnceCell<ort::Session> = OnceCell::new();
+static SESSION: OnceCell<Mutex<ort::session::Session>> = OnceCell::new();
 static THRESHOLD_BG: OnceCell<u8> = OnceCell::new();
 
 #[derive(Parser, Debug)]
@@ -41,9 +41,9 @@ pub struct App {
     #[clap(short, long, default_value = "false")]
     crop: bool,
     #[clap(short = 'S', long, conflicts_with("input_file"))]
-    stdin: bool, // Flag to read image from stdin
+    stdin: bool,
     #[clap(short = 's', long, conflicts_with("output_file"))]
-    stdout: bool, // Flag to write cropped image to stdout
+    stdout: bool,
     #[clap(short = 'H', long)]
     http: bool,
     #[clap(short, long, default_value = "0.0.0.0")]
@@ -56,7 +56,6 @@ pub struct App {
     model: String,
 }
 
-//#[tokio::main(flavor = "current_thread")]
 #[tokio::main(worker_threads = 10)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -66,11 +65,9 @@ async fn main() -> Result<()> {
     if args.http {
         http::start_http_server(&args).await?;
     }
-    let session = onnx::onnx_session(&args.model)?;
+    let mut session = onnx::onnx_session(&args.model)?;
 
-    // Determine the source of the input image
     let img: Option<DynamicImage> = if args.stdin {
-        // Read image from stdin
         let mut buffer = Vec::new();
         io::stdin().read_to_end(&mut buffer)?;
         if is_jpeg(&buffer) {
@@ -91,7 +88,7 @@ async fn main() -> Result<()> {
     };
 
     if img.is_some() {
-        let processed_dynamic_img = process_dynamic_image(&session, img.unwrap())?;
+        let processed_dynamic_img = process_dynamic_image(&mut session, img.unwrap())?;
         if args.crop {
             let mut output_img = processed_dynamic_img.to_rgba8();
             let alpha_bounds = find_alpha_bounds(&output_img);
@@ -99,7 +96,6 @@ async fn main() -> Result<()> {
                 let cropped_img =
                     imageops::crop(&mut output_img, min_x, min_y, max_x - min_x, max_y - min_y)
                         .to_image();
-                // Convert the cropped image to a full image
                 let mut full_cropped_img = ImageBuffer::new(max_x - min_x, max_y - min_y);
                 full_cropped_img.copy_from(&cropped_img, 0, 0).ok();
 
@@ -117,7 +113,6 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     }
 
-    // Input image file folder path
     let input_images_folder = Path::new(&args.input_images_folder);
     let output_images_folder = Path::new("output_images");
     fs::create_dir_all(&output_images_folder)?;
@@ -151,9 +146,8 @@ async fn main() -> Result<()> {
                 + "_nbg.png",
         );
 
-        // Start timing
         let start_time = Instant::now();
-        let mut output_img = process_image(&session, input_img_file, &output_img_file)?;
+        let mut output_img = process_image(&mut session, input_img_file, &output_img_file)?;
 
         let elapsed_time = start_time.elapsed();
         println!(
@@ -169,11 +163,9 @@ async fn main() -> Result<()> {
                 let cropped_img =
                     imageops::crop(&mut output_img, min_x, min_y, max_x - min_x, max_y - min_y)
                         .to_image();
-                // Convert the cropped image to a full image
                 let mut full_cropped_img = ImageBuffer::new(max_x - min_x, max_y - min_y);
                 full_cropped_img.copy_from(&cropped_img, 0, 0).ok();
 
-                // Modify the output file path to include "_cropped" before the extension
                 let mut output_img_file_cropped = output_img_file.clone();
                 if let Some(_extension) = output_img_file_cropped.extension() {
                     let file_stem = output_img_file_cropped.file_stem().unwrap();
@@ -181,12 +173,10 @@ async fn main() -> Result<()> {
                     output_img_file_cropped.set_file_name(new_file_stem);
                 }
 
-                // Append the original extension to the modified output file path
                 if let Some(extension) = output_img_file.extension() {
                     output_img_file_cropped.set_extension(extension);
                 }
 
-                // Save the cropped image
                 full_cropped_img.save(output_img_file_cropped)?;
             }
         }
@@ -195,20 +185,24 @@ async fn main() -> Result<()> {
 }
 
 fn process_image(
-    session: &ort::Session,
+    session: &mut ort::session::Session,
     input_img_file: &PathBuf,
     output_img_file: &PathBuf,
 ) -> Result<ImageBuffer<image::Rgba<u8>, Vec<u8>>, anyhow::Error> {
-    let input_shape = session.inputs[0]
-        .dimensions()
-        .map(|dim| dim.unwrap())
-        .collect::<Vec<usize>>();
+    let input_shape: Vec<usize> = session
+        .inputs()[0]
+        .dtype()
+        .tensor_shape()
+        .unwrap()
+        .iter()
+        .map(|&dim| dim as usize)
+        .collect();
     let input_img = image::open(input_img_file).unwrap().into_rgba8();
     let scaling_factor = f32::min(
-        1., // Avoid upscaling
+        1.,
         f32::min(
-            input_shape[3] as f32 / input_img.width() as f32, // Width ratio
-            input_shape[2] as f32 / input_img.height() as f32, // Height ratio
+            input_shape[3] as f32 / input_img.width() as f32,
+            input_shape[2] as f32 / input_img.height() as f32,
         ),
     );
     let mut resized_img = imageops::resize(
@@ -217,19 +211,19 @@ fn process_image(
         input_shape[2] as u32,
         imageops::FilterType::Triangle,
     );
-    let input_tensor = CowArray::from(
-        Array::from_shape_fn(input_shape, |indices| {
-            let mean = 128.;
-            let std = 256.;
+    let input_tensor = Array::from_shape_fn(input_shape, |indices| {
+        let mean = 128.;
+        let std = 256.;
 
-            (resized_img[(indices[3] as u32, indices[2] as u32)][indices[1]] as f32 - mean) / std
-        })
-        .into_dyn(),
-    );
-    let inputs = vec![Value::from_array(session.allocator(), &input_tensor)?];
+        (resized_img[(indices[3] as u32, indices[2] as u32)][indices[1]] as f32 - mean) / std
+    });
+    let inputs = ort::inputs![Tensor::from_array(input_tensor)?];
     let outputs = session.run(inputs)?;
-    let output_tensor = outputs[0].try_extract::<f32>()?;
-    for (indices, alpha) in output_tensor.view().indexed_iter() {
+    let (shape, data) = outputs[0].try_extract_tensor::<f32>()?;
+    let output_dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    let array_view = ndarray::ArrayViewD::from_shape(output_dims, data)
+        .map_err(|e| anyhow::anyhow!("shape error: {}", e))?;
+    for (indices, alpha) in array_view.indexed_iter() {
         resized_img[(indices[3] as u32, indices[2] as u32)][3] = (alpha * 255.) as u8;
     }
     let output_img = imageops::resize(
@@ -242,7 +236,6 @@ fn process_image(
     Ok(output_img)
 }
 
-// Function to find the bounding box containing non-transparent pixels
 fn find_alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
     let mut min_x = u32::MAX;
     let mut max_x = 0;
@@ -252,7 +245,6 @@ fn find_alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
 
     for (x, y, pixel) in image.enumerate_pixels() {
         if pixel[3] > *thres_b {
-            // Non-transparent pixel
             min_x = min_x.min(x);
             max_x = max_x.max(x);
             min_y = min_y.min(y);
@@ -269,19 +261,23 @@ fn find_alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
 }
 
 fn process_dynamic_image(
-    session: &ort::Session,
+    session: &mut ort::session::Session,
     dynamic_img: DynamicImage,
 ) -> Result<DynamicImage, anyhow::Error> {
-    let input_shape = session.inputs[0]
-        .dimensions()
-        .map(|dim| dim.unwrap())
-        .collect::<Vec<usize>>();
+    let input_shape: Vec<usize> = session
+        .inputs()[0]
+        .dtype()
+        .tensor_shape()
+        .unwrap()
+        .iter()
+        .map(|&dim| dim as usize)
+        .collect();
     let input_img = dynamic_img.into_rgba8();
     let scaling_factor = f32::min(
-        1., // Avoid upscaling
+        1.,
         f32::min(
-            input_shape[3] as f32 / input_img.width() as f32, // Width ratio
-            input_shape[2] as f32 / input_img.height() as f32, // Height ratio
+            input_shape[3] as f32 / input_img.width() as f32,
+            input_shape[2] as f32 / input_img.height() as f32,
         ),
     );
     let mut resized_img = imageops::resize(
@@ -290,19 +286,19 @@ fn process_dynamic_image(
         input_shape[2] as u32,
         imageops::FilterType::Triangle,
     );
-    let input_tensor = CowArray::from(
-        Array::from_shape_fn(input_shape, |indices| {
-            let mean = 128.;
-            let std = 256.;
+    let input_tensor = Array::from_shape_fn(input_shape, |indices| {
+        let mean = 128.;
+        let std = 256.;
 
-            (resized_img[(indices[3] as u32, indices[2] as u32)][indices[1]] as f32 - mean) / std
-        })
-        .into_dyn(),
-    );
-    let inputs = vec![Value::from_array(session.allocator(), &input_tensor)?];
+        (resized_img[(indices[3] as u32, indices[2] as u32)][indices[1]] as f32 - mean) / std
+    });
+    let inputs = ort::inputs![Tensor::from_array(input_tensor)?];
     let outputs = session.run(inputs)?;
-    let output_tensor = outputs[0].try_extract::<f32>()?;
-    for (indices, alpha) in output_tensor.view().indexed_iter() {
+    let (shape, data) = outputs[0].try_extract_tensor::<f32>()?;
+    let output_dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    let array_view = ndarray::ArrayViewD::from_shape(output_dims, data)
+        .map_err(|e| anyhow::anyhow!("shape error: {}", e))?;
+    for (indices, alpha) in array_view.indexed_iter() {
         resized_img[(indices[3] as u32, indices[2] as u32)][3] = (alpha * 255.) as u8;
     }
     let output_img = imageops::resize(

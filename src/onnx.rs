@@ -1,16 +1,15 @@
-use ort::{Environment, ExecutionProvider, GraphOptimizationLevel, SessionBuilder};
+use ort::session::builder::GraphOptimizationLevel;
+use ort::session::Session;
 
-pub(crate) fn onnx_session(onnx_model_file: &str) -> Result<ort::Session, anyhow::Error> {
-    let environment = Environment::default().into_arc();
-    let session = SessionBuilder::new(&environment)?
-        .with_optimization_level(GraphOptimizationLevel::Level1)? // Configure model optimization level
-        .with_intra_threads(1)? // Configure the number of threads used for inference
+pub(crate) fn onnx_session(onnx_model_file: &str) -> ort::Result<Session> {
+    let session = Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level1)?
+        .with_intra_threads(1)?
         .with_execution_providers([
-            // Configure execution providers (e.g., CUDA, CoreML, CPU)
-            ExecutionProvider::CUDA(Default::default()),
-            ExecutionProvider::CoreML(Default::default()),
-            ExecutionProvider::CPU(Default::default()),
+            ort::ep::CUDA::default().build(),
+            ort::ep::CoreML::default().build(),
+            ort::ep::CPU::default().build(),
         ])?
-        .with_model_from_file(onnx_model_file)?;
+        .commit_from_file(onnx_model_file)?;
     Ok(session)
 }
